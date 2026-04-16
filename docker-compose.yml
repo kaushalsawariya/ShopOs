@@ -1,0 +1,21 @@
+version: '3.9'
+
+services:
+  shopos:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shopos_app
+    env_file:
+      - .env
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+      - ./data:/app/data
+    environment:
+      - STREAMLIT_SERVER_ENABLECORS=false
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_HEADLESS=true
+    command: ["streamlit", "run", "ui/app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+    restart: unless-stopped
