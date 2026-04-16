@@ -31,7 +31,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-STORE_PATH = Path(os.getenv("VECTOR_STORE_PATH", "./data/vector_store")) / "faiss_index"
+LEGACY_VECTOR_STORE_PATH = "./data/vector_store"
+
+
+def _default_vector_store_root() -> Path:
+    configured = os.getenv("VECTOR_STORE_PATH", LEGACY_VECTOR_STORE_PATH)
+    if configured != LEGACY_VECTOR_STORE_PATH:
+        return Path(configured)
+
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if os.name == "nt" and local_app_data:
+        return Path(local_app_data) / "ShopOS" / "vector_store"
+    return Path(LEGACY_VECTOR_STORE_PATH)
+
+
+STORE_PATH = _default_vector_store_root() / "faiss_index"
+LEGACY_STORE_PATH = Path(LEGACY_VECTOR_STORE_PATH) / "faiss_index"
 
 # ── Models ───────────────────────────────────────────────────────────────────
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small",
@@ -81,9 +96,18 @@ def _load_store() -> FAISS | None:
     global _store
     if _store is not None:
         return _store
-    if STORE_PATH.exists() and (STORE_PATH / "index.faiss").exists():
-        _store = FAISS.load_local(str(STORE_PATH), embeddings,
-                                  allow_dangerous_deserialization=True)
+    candidate_paths = [STORE_PATH]
+    if LEGACY_STORE_PATH != STORE_PATH:
+        candidate_paths.append(LEGACY_STORE_PATH)
+
+    for candidate in candidate_paths:
+        if candidate.exists() and (candidate / "index.faiss").exists():
+            _store = FAISS.load_local(
+                str(candidate),
+                embeddings,
+                allow_dangerous_deserialization=True,
+            )
+            break
     return _store
 
 
@@ -127,15 +151,23 @@ def clear_vector_store() -> str:
     """
     global _store
     _store = None
-    if STORE_PATH.exists():
-        shutil.rmtree(STORE_PATH)
+    cleared = False
+    for candidate in [STORE_PATH, LEGACY_STORE_PATH]:
+        if candidate.exists():
+            shutil.rmtree(candidate)
+            cleared = True
+    if cleared:
         return "✅ Vector store cleared successfully."
     return "ℹ️ Vector store was already empty."
 
 
 def is_indexed() -> bool:
     """Returns True if a FAISS index file exists on disk."""
-    return (STORE_PATH / "index.faiss").exists() if STORE_PATH.exists() else False
+    return any(
+        (candidate / "index.faiss").exists()
+        for candidate in [STORE_PATH, LEGACY_STORE_PATH]
+        if candidate.exists()
+    )
 
 
 def search(query: str, k: int = 4) -> List[Document]:

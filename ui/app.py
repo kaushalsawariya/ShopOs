@@ -282,10 +282,12 @@ if page == "🤖 AI Assistant":
 
         # Prepare file data if uploaded (image or PDF)
         file_base64 = None
+        file_name = None
         if uploaded_file:
-            file_bytes = uploaded_file.read()
+            file_bytes = uploaded_file.getvalue()
             if len(file_bytes) <= 10 * 1024 * 1024:  # 10MB limit
                 file_base64 = base64.b64encode(file_bytes).decode()
+                file_name = uploaded_file.name
             else:
                 st.error("File too large (max 10MB)")
 
@@ -296,14 +298,16 @@ if page == "🤖 AI Assistant":
                     result = run_agent(
                         user_message=user_input,
                         history=st.session_state.chat_history[:-1],  # exclude current message
-                        file_base64=file_base64
+                        file_base64=file_base64,
+                        file_name=file_name
                     )
             else:
                 with st.spinner("🤖 Thinking..."):
                     result = run_agent(
                         user_message=user_input,
                         history=st.session_state.chat_history[:-1],  # exclude current message
-                        file_base64=file_base64
+                        file_base64=file_base64,
+                        file_name=file_name
                     )
 
             st.markdown(result["response"])

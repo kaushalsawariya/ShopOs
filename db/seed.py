@@ -229,15 +229,83 @@ TERMS = [
    Include the invoice number, the disputed line item, and the reason for dispute.
    We will investigate and issue a corrected invoice or credit note within 5 business days.
 """),
+    dict(
+        title="GST and Tax Invoice Notes",
+        category="tax",
+        version="1.0",
+        effective_date=date(2024, 4, 1),
+        content="""GST AND TAX INVOICE NOTES
+
+1. REQUIRED TAX FIELDS
+   Invoice number, issue date, supplier details, customer details, taxable value, GST rate, and tax amount.
+
+2. TAX BREAKDOWN
+   Intra-state invoices usually show CGST and SGST, while inter-state invoices may show IGST.
+
+3. ROUNDING
+   Final payable totals may be rounded to the nearest rupee.
+"""),
+    dict(
+        title="Supplier Delivery and Receiving Policy",
+        category="operations",
+        version="1.1",
+        effective_date=date(2024, 2, 15),
+        content="""SUPPLIER DELIVERY AND RECEIVING POLICY
+
+1. RECEIVING CHECKS
+   Every shipment should be checked against the purchase order, delivery note, and invoice.
+
+2. DAMAGE HANDLING
+   Damaged goods must be recorded and reported within 24 hours.
+
+3. DOCUMENT MATCHING
+   Accounts must verify supplier name, invoice number, invoice date, line totals, tax totals, and final amount before posting payables.
+"""),
 ]
 
 
+def _backfill_terms_and_demo_state(db: Session):
+    existing_titles = {title for (title,) in db.query(TermsConditions.title).all()}
+    for term in TERMS:
+        if term["title"] not in existing_titles:
+            db.add(TermsConditions(**term))
+
+    low_stock_targets = {"TECH-005": 3, "FURN-002": 1, "HLTH-002": 4}
+    for sku, quantity in low_stock_targets.items():
+        product = db.query(Product).filter(Product.sku == sku).first()
+        if product and product.stock_quantity > quantity:
+            product.stock_quantity = quantity
+
+    overdue_count = db.query(Invoice).filter(Invoice.status == "overdue").count()
+    if overdue_count < 3:
+        customers = db.query(Customer).order_by(Customer.id).limit(3).all()
+        for idx, customer in enumerate(customers, start=1):
+            invoice_number = f"INV-DEMO-OD-{idx:03d}"
+            exists = db.query(Invoice).filter(Invoice.invoice_number == invoice_number).first()
+            if exists:
+                continue
+            amount = 18000 + (idx * 5500)
+            paid_amount = 0 if idx != 2 else 5000
+            db.add(Invoice(
+                invoice_number=invoice_number,
+                customer_id=customer.id,
+                issue_date=date.today() - timedelta(days=45 + idx * 5),
+                due_date=date.today() - timedelta(days=15 + idx * 4),
+                amount=amount,
+                paid_amount=paid_amount,
+                status="overdue",
+                notes="Auto-seeded overdue invoice for analytics demos.",
+            ))
+
+
 def seed_database():
-    """Seeds all tables with test data. Skips if data already exists."""
+    """Seed base data once, then safely backfill demo data on later runs."""
     init_db()
     with Session(engine) as db:
         if db.query(Customer).count() > 0:
-            return   # Already seeded
+            _backfill_terms_and_demo_state(db)
+            db.commit()
+            return
 
         # Suppliers
         sup_objs = [Supplier(**s) for s in SUPPLIERS]
@@ -325,8 +393,7 @@ def seed_database():
                     paid_by="Shop Owner",
                 ))
 
-        # Terms & Conditions
-        for t in TERMS:
-            db.add(TermsConditions(**t))
+        # Terms & Conditions and demo state
+        _backfill_terms_and_demo_state(db)
 
         db.commit()

@@ -9,11 +9,12 @@ import json
 import base64
 import pathlib
 import io
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
+
+from PyPDF2 import PdfReader
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from pdf2image import convert_from_bytes
-from PIL import Image
 
 from .token_manager import token_manager
 from .retry_handler import retry_handler
@@ -65,28 +66,31 @@ Return ONLY a JSON object with these fields:
 
     def _convert_pdf_to_images(self, pdf_bytes: bytes) -> List[str]:
         """Convert PDF pages to base64 encoded images."""
+        images = convert_from_bytes(pdf_bytes, dpi=220, fmt="JPEG", size=(None, 1400))
+
+        base64_images = []
+        for i, img in enumerate(images):
+            img_buffer = io.BytesIO()
+            img.save(img_buffer, format="JPEG", quality=92)
+            img_bytes = img_buffer.getvalue()
+            base64_images.append(base64.b64encode(img_bytes).decode("utf-8"))
+            if i >= 4:
+                break
+
+        return base64_images
+
+    def _extract_text_from_pdf(self, pdf_bytes: bytes) -> str:
+        """Fallback for text-based PDFs when image conversion is unavailable."""
         try:
-            # Convert PDF to images
-            images = convert_from_bytes(pdf_bytes, dpi=300, fmt='JPEG', size=(None, 1200))
-
-            base64_images = []
-            for i, img in enumerate(images):
-                # Convert PIL image to bytes
-                img_buffer = io.BytesIO()
-                img.save(img_buffer, format='JPEG', quality=95)
-                img_bytes = img_buffer.getvalue()
-
-                # Convert to base64
-                base64_str = base64.b64encode(img_bytes).decode('utf-8')
-                base64_images.append(base64_str)
-
-                # Limit to first 5 pages to avoid excessive processing
-                if i >= 4:
-                    break
-
-            return base64_images
-        except Exception as e:
-            raise Exception(f"PDF conversion failed: {str(e)}")
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            pages = []
+            for index, page in enumerate(reader.pages[:5]):
+                page_text = (page.extract_text() or "").strip()
+                if page_text:
+                    pages.append(f"[Page {index + 1}]\n{page_text}")
+            return "\n\n".join(pages).strip()
+        except Exception:
+            return ""
 
     def _extract_data_from_image(self, image_base64: str, filename: str) -> Dict[str, Any]:
         """Extract structured data from a single image."""
@@ -139,6 +143,49 @@ Return ONLY a JSON object with these fields:
         except Exception as e:
             return {"error": f"Extraction failed: {str(e)}"}
 
+    def _extract_data_from_pdf_text(self, pdf_text: str) -> Dict[str, Any]:
+        """Extract structured invoice data from text-based PDF content."""
+        context = self._get_optimized_context("Extract invoice fields from PDF text")
+        prompt = f"""Extract invoice data from the PDF text below. Use this context: {context}
+
+Return ONLY a JSON object with these fields:
+{{
+  "invoice_number": "string or null",
+  "vendor_name": "string or null",
+  "customer_name": "string or null",
+  "date": "YYYY-MM-DD or null",
+  "due_date": "YYYY-MM-DD or null",
+  "subtotal": 0,
+  "cgst": 0,
+  "sgst": 0,
+  "total_amount": 0,
+  "payment_method": "string or null",
+  "payment_status": "paid/pending/partial/overdue or null",
+  "currency": "INR",
+  "line_items": []
+}}
+
+PDF text:
+{pdf_text}
+"""
+
+        def _make_text_call():
+            prompt_tokens = token_manager.count_tokens(prompt)
+            if not token_manager.rate_limiter.can_make_request(prompt_tokens + 300):
+                token_manager.rate_limiter.wait_if_needed(prompt_tokens + 300)
+
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            raw_content = response.content.strip().replace("```json", "").replace("```", "").strip()
+            token_manager.rate_limiter.record_request(
+                prompt_tokens + token_manager.count_tokens(raw_content)
+            )
+            return json.loads(raw_content)
+
+        try:
+            return retry_handler.execute_with_retry(_make_text_call)
+        except Exception as e:
+            return {"error": f"PDF text extraction failed: {str(e)}"}
+
     def _extract_data(self, file_base64: str, filename: str) -> Dict[str, Any]:
         """Extract structured data from bill (image or PDF)."""
         ext = pathlib.Path(filename).suffix.lower()
@@ -147,7 +194,24 @@ Return ONLY a JSON object with these fields:
             # Handle PDF files
             try:
                 pdf_bytes = base64.b64decode(file_base64)
-                images_base64 = self._convert_pdf_to_images(pdf_bytes)
+                try:
+                    images_base64 = self._convert_pdf_to_images(pdf_bytes)
+                except Exception as conversion_error:
+                    pdf_text = self._extract_text_from_pdf(pdf_bytes)
+                    if pdf_text:
+                        extracted = self._extract_data_from_pdf_text(pdf_text)
+                        if "error" not in extracted:
+                            extracted["processing_note"] = (
+                                "Processed from embedded PDF text because image conversion "
+                                "was unavailable in the local environment."
+                            )
+                        return extracted
+                    return {
+                        "error": (
+                            "PDF processing failed during image conversion. "
+                            f"{conversion_error}. Install Poppler for scanned PDFs."
+                        )
+                    }
 
                 if not images_base64:
                     return {"error": "PDF contains no readable pages"}

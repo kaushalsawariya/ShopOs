@@ -16,7 +16,7 @@ class TokenManager:
 
     def __init__(self, model: str = "gpt-4o"):
         self.model = model
-        self.encoding = tiktoken.encoding_for_model(model)
+        self.encoding = self._load_encoding(model)
         self.max_tokens = {
             "gpt-4o": 128000,
             "gpt-4": 8192,
@@ -24,8 +24,21 @@ class TokenManager:
         }.get(model, 128000)
         self.rate_limiter = RateLimiter()  # Add rate limiter instance
 
+    def _load_encoding(self, model: str):
+        """Load tokenizer assets without making the app depend on network access."""
+        try:
+            return tiktoken.encoding_for_model(model)
+        except Exception:
+            try:
+                return tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                return None
+
     def count_tokens(self, text: str) -> int:
         """Count tokens in a text string."""
+        text = "" if text is None else str(text)
+        if self.encoding is None:
+            return max(1, len(text) // 4) if text else 0
         return len(self.encoding.encode(text))
 
     def count_messages(self, messages: List[BaseMessage]) -> int:
@@ -40,6 +53,15 @@ class TokenManager:
 
     def truncate_text(self, text: str, max_tokens: int, preserve_start: bool = True) -> str:
         """Truncate text to fit within token limit."""
+        text = "" if text is None else str(text)
+        if self.encoding is None:
+            approx_chars = max_tokens * 4
+            if len(text) <= approx_chars:
+                return text
+            if preserve_start:
+                return text[: max(0, approx_chars - 3)] + "..."
+            return "..." + text[-max(0, approx_chars - 3):]
+
         tokens = self.encoding.encode(text)
         if len(tokens) <= max_tokens:
             return text

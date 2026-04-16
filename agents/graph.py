@@ -28,12 +28,13 @@ The supervisor reads agent outputs and decides if another agent is needed.
 """
 
 import os
-from typing import Annotated, Literal, TypedDict, Sequence
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, ToolMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
+from typing import Annotated, TypedDict
+
 from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 
 from mcp.tools import (
     query_database, search_policies, analyze_bill_file,
@@ -50,8 +51,10 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], lambda x, y: x + y]  # append-only
     next_agent: str       # which agent to route to next
+    current_agent: str    # agent currently handling the turn
     final_answer: str     # accumulated final response
     file_base64: str | None  # base64 encoded file data for bill analysis
+    file_name: str | None    # uploaded file name
 
 
 # ── Helper: build an LLM bound to specific tools ────────────────────────────
@@ -78,6 +81,9 @@ Respond with ONLY the agent name."""
 
 def supervisor_node(state: AgentState) -> AgentState:
     """Routes the conversation to the appropriate specialist."""
+    if state.get("file_base64"):
+        return {**state, "next_agent": "bill_agent"}
+
     llm = make_llm()
     # Get the last human message for routing decision
     last_msg = next((m for m in reversed(state["messages"])
@@ -105,23 +111,23 @@ def supervisor_router(state: AgentState) -> str:
 # ══════════════════════════════════════════════════════════════════
 # NODE: SQL AGENT — handles data queries
 # ══════════════════════════════════════════════════════════════════
-SQL_SYSTEM = """Use query_database or get_customer_summary tools for real data. Format currency as ₹. Be concise."""
+SQL_SYSTEM = """Use query_database or get_customer_summary tools for real data. Format currency as Rs. Be concise."""
 
 def sql_agent_node(state: AgentState) -> AgentState:
     llm = make_llm([query_database, get_customer_summary])
     response = llm.invoke([SystemMessage(content=SQL_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response]}
+    return {**state, "messages": [response], "current_agent": "sql_agent"}
 
 
 # ══════════════════════════════════════════════════════════════════
 # NODE: RAG AGENT — handles policy questions
 # ══════════════════════════════════════════════════════════════════
-RAG_SYSTEM = """Use search_policies tool for return policies, warranties, credit terms, payment policies. Quote relevant sections."""
+RAG_SYSTEM = """Use search_policies for return policies, warranties, credit terms, and payment policies."""
 
 def rag_agent_node(state: AgentState) -> AgentState:
     llm = make_llm([search_policies])
     response = llm.invoke([SystemMessage(content=RAG_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response]}
+    return {**state, "messages": [response], "current_agent": "rag_agent"}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -133,27 +139,21 @@ This works for both images (JPG, PNG, WebP) and PDFs.
 Present the extracted information clearly with all amounts in ₹."""
 
 def bill_agent_node(state: AgentState) -> AgentState:
-    # Create a custom tool that has access to the file data
-    from mcp.tools import analyze_bill_file
-
-    # Bind the file data to the tool
-    file_base64 = state.get("file_base64", "")
+    file_base64 = state.get("file_base64")
     if file_base64:
-        # Create a tool instance with the file data
-        def analyze_bill_with_data(filename: str = "bill.jpg") -> str:
-            from core.bill_analyzer import BillAnalyzer
-            analyzer = BillAnalyzer()
-            return analyzer.analyze_bill(file_base64, filename)
+        from core.bill_analyzer import BillAnalyzer
 
-        # Create a tool from the function
-        from langchain_core.tools import tool
-        analyze_bill_tool = tool(analyze_bill_with_data)
-        llm = make_llm([analyze_bill_tool])
-    else:
-        llm = make_llm([analyze_bill_file])
+        analyzer = BillAnalyzer()
+        response_text = analyzer.analyze_bill(file_base64, state.get("file_name") or "uploaded_bill")
+        return {
+            **state,
+            "messages": [AIMessage(content=response_text)],
+            "current_agent": "bill_agent",
+        }
 
+    llm = make_llm([analyze_bill_file])
     response = llm.invoke([SystemMessage(content=BILL_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response]}
+    return {**state, "messages": [response], "current_agent": "bill_agent"}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -169,7 +169,7 @@ Present data with clear formatting and ₹ for currency."""
 def analytics_agent_node(state: AgentState) -> AgentState:
     llm = make_llm([get_sales_summary, check_overdue_invoices, get_low_stock_alerts])
     response = llm.invoke([SystemMessage(content=ANALYTICS_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response]}
+    return {**state, "messages": [response], "current_agent": "analytics_agent"}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -182,7 +182,7 @@ For greetings or clarifications, respond directly without using tools."""
 def general_agent_node(state: AgentState) -> AgentState:
     llm = make_llm(ALL_TOOLS)
     response = llm.invoke([SystemMessage(content=GENERAL_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response]}
+    return {**state, "messages": [response], "current_agent": "general_agent"}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -200,6 +200,12 @@ def should_continue(state: AgentState) -> str:
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
         return "tools"
     return END
+
+
+def route_back_to_current_agent(state: AgentState) -> str:
+    current_agent = state.get("current_agent", "general_agent")
+    valid = {"sql_agent", "rag_agent", "bill_agent", "analytics_agent", "general_agent"}
+    return current_agent if current_agent in valid else "general_agent"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -240,11 +246,17 @@ def build_graph() -> StateGraph:
     for agent in ["sql_agent","rag_agent","bill_agent","analytics_agent","general_agent"]:
         graph.add_conditional_edges(agent, should_continue, {"tools": "tools", END: END})
 
-    # After tools execute, return to the same agent for final answer
-    # (tools send result back; agent interprets and responds)
-    graph.add_edge("tools", "sql_agent")      # tools always return to sql_agent
-    # Note: in a more complex setup you'd track which agent called tools.
-    # For simplicity, tools loop back through sql_agent (covers 80% of tool use).
+    graph.add_conditional_edges(
+        "tools",
+        route_back_to_current_agent,
+        {
+            "sql_agent": "sql_agent",
+            "rag_agent": "rag_agent",
+            "bill_agent": "bill_agent",
+            "analytics_agent": "analytics_agent",
+            "general_agent": "general_agent",
+        }
+    )
 
     return graph.compile()
 
@@ -267,6 +279,7 @@ def run_agent(
     user_message: str,
     history: list[dict] | None = None,
     file_base64: str | None = None,
+    file_name: str | None = None,
 ) -> dict:
     """
     Run the multi-agent graph for one user turn.
@@ -275,6 +288,7 @@ def run_agent(
         user_message : Plain text from the user
         history      : List of {"role": "user"/"assistant", "content": "..."} dicts
         file_base64  : Optional base64-encoded bill file (image or PDF)
+        file_name    : Uploaded file name used to detect PDF/image handling
 
     Returns:
         {
@@ -317,8 +331,10 @@ def run_agent(
         initial_state: AgentState = {
             "messages": messages,
             "next_agent": "general_agent",
+            "current_agent": "general_agent",
             "final_answer": "",
             "file_base64": file_data,
+            "file_name": file_name,
         }
         result = get_graph().invoke(initial_state)
 
@@ -340,7 +356,7 @@ def run_agent(
 
         return {
             "response":   response_text,
-            "route":      result.get("next_agent", "unknown"),
+            "route":      result.get("current_agent", result.get("next_agent", "unknown")),
             "tools_used": list(set(tools_used)),
             "error":      None,
         }
