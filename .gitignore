@@ -135,7 +135,7 @@ dmypy.json
 *.sqlite3
 
 # Data directories (vector stores, embeddings, etc.)
-data/
+
 vector_store/
 embeddings/
 

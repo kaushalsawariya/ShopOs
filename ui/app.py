@@ -50,49 +50,147 @@ st.set_page_config(
 # ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* Light theme styling */
-  [data-testid="stSidebar"] { background: #f8f9fa; border-right: 1px solid #e9ecef; }
-  .stButton>button { border-radius: 8px; font-weight: 600; transition: all .15s; background: #ffffff; border: 1px solid #dee2e6; }
-  .stButton>button:hover { border-color: #007bff !important; color: #007bff !important; background: #f8f9fa !important; }
-  .metric-card {
-    background: #ffffff; border: 1px solid #dee2e6; border-radius: 12px;
-    padding: 16px 20px; margin-bottom: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  :root {
+    --bg: #f4efe6;
+    --panel: rgba(255,255,255,0.84);
+    --ink: #1f2a2e;
+    --muted: #617076;
+    --line: rgba(80, 63, 43, 0.14);
+    --accent: #b85c38;
+    --accent-soft: rgba(184, 92, 56, 0.12);
+    --accent-2: #2f6c7a;
+    --accent-2-soft: rgba(47, 108, 122, 0.12);
+    --shadow: 0 18px 40px rgba(94, 73, 44, 0.10);
   }
-  .metric-card .label { font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
-    color: #6c757d; margin-bottom: 4px; }
-  .metric-card .value { font-size: 28px; font-weight: 800; color: #212529; line-height: 1.1; }
-  .metric-card .sub { font-size: 11px; color: #6c757d; margin-top: 4px; }
+  .stApp {
+    background:
+      radial-gradient(circle at top left, rgba(184, 92, 56, 0.10), transparent 28%),
+      radial-gradient(circle at top right, rgba(47, 108, 122, 0.12), transparent 22%),
+      linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
+    color: var(--ink);
+    font-family: "Aptos", "Trebuchet MS", "Segoe UI", sans-serif;
+  }
+  [data-testid="stSidebar"] {
+    background: linear-gradient(180deg, rgba(255,250,242,0.95) 0%, rgba(243,235,223,0.95) 100%);
+    border-right: 1px solid var(--line);
+  }
+  .block-container { padding-top: 2.2rem; max-width: 1180px; }
+  .stButton>button {
+    border-radius: 999px; font-weight: 700; transition: all .18s ease;
+    background: linear-gradient(180deg, #fffdf9 0%, #f8efe3 100%);
+    border: 1px solid rgba(184, 92, 56, 0.25); color: var(--ink);
+    box-shadow: 0 8px 18px rgba(84, 56, 27, 0.08);
+  }
+  .stButton>button:hover {
+    border-color: rgba(184, 92, 56, 0.55) !important;
+    color: var(--accent) !important; transform: translateY(-1px);
+  }
+  [data-testid="stFileUploader"], [data-testid="stChatMessage"] {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 20px; box-shadow: var(--shadow);
+  }
+  [data-testid="stFileUploader"] { padding: 0.4rem 0.8rem; }
+  [data-testid="stChatMessage"] { padding: 0.7rem 0.85rem; margin-bottom: 0.8rem; }
+  .hero-card {
+    background:
+      radial-gradient(circle at 85% 15%, rgba(255,255,255,0.5), transparent 20%),
+      linear-gradient(135deg, #204e57 0%, #2f6c7a 42%, #e9dcc8 42%, #f8f2e8 100%);
+    border: 1px solid rgba(32, 78, 87, 0.12);
+    border-radius: 28px; padding: 26px 28px; margin: 0 0 18px 0;
+    box-shadow: var(--shadow); overflow: hidden;
+  }
+  .hero-kicker {
+    display: inline-block; padding: 6px 12px; border-radius: 999px;
+    background: rgba(255,255,255,0.16); color: #fff8ef;
+    border: 1px solid rgba(255,255,255,0.2); font-size: 11px;
+    letter-spacing: .14em; text-transform: uppercase; font-weight: 800;
+  }
+  .hero-title {
+    margin: 14px 0 8px 0; font-size: 2.25rem; line-height: 1.02;
+    font-weight: 900; color: #fffaf1; max-width: 560px;
+  }
+  .hero-copy { margin: 0; max-width: 560px; color: rgba(255,248,238,0.86); font-size: 1rem; line-height: 1.55; }
+  .stat-grid, .feature-list, .settings-grid {
+    display: grid; gap: 12px;
+  }
+  .stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 20px; }
+  .feature-list, .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 14px; }
+  .stat-card, .surface-card, .sidebar-panel, .settings-tile, .feature-pill {
+    background: var(--panel); border: 1px solid var(--line);
+    box-shadow: 0 10px 24px rgba(92, 71, 46, 0.06);
+  }
+  .stat-card { border-radius: 18px; padding: 14px 16px; }
+  .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: rgba(32,45,48,0.62); margin-bottom: 4px; font-weight: 700; }
+  .stat-value { font-size: 1.1rem; font-weight: 800; color: var(--ink); }
+  .surface-card, .settings-tile { border-radius: 24px; padding: 18px 20px; margin-bottom: 16px; }
+  .surface-title { font-size: 1.08rem; font-weight: 800; color: var(--ink); margin-bottom: 4px; }
+  .surface-copy, .mini-note, .settings-tile span { color: var(--muted); font-size: 0.95rem; }
+  .sidebar-panel { border-radius: 20px; padding: 14px 16px; margin-bottom: 14px; }
+  .sidebar-title { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.14em; color: var(--muted); margin-bottom: 6px; font-weight: 800; }
+  .sidebar-big { font-size: 1.05rem; font-weight: 800; color: var(--ink); }
+  .feature-pill { border-radius: 16px; padding: 10px 12px; font-size: 0.92rem; color: var(--ink); }
   .agent-badge {
-    display: inline-block; padding: 2px 10px; border-radius: 20px;
-    font-size: 11px; font-weight: 600; background: rgba(0,123,255,.12);
-    color: #007bff; border: 1px solid rgba(0,123,255,.25); margin-left: 8px;
+    display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 11px;
+    font-weight: 800; background: var(--accent-soft); color: var(--accent);
+    border: 1px solid rgba(184, 92, 56, 0.18); margin-right: 6px; margin-top: 6px;
   }
   .tool-chip {
-    display: inline-block; padding: 1px 8px; border-radius: 20px;
-    font-size: 10px; background: #f8f9fa; color: #495057;
-    border: 1px solid #dee2e6; margin: 1px;
+    display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 10px;
+    font-weight: 700; background: var(--accent-2-soft); color: var(--accent-2);
+    border: 1px solid rgba(47,108,122,0.16); margin: 6px 6px 0 0;
   }
-  .source-chip {
-    display: inline-block; padding: 2px 8px; border-radius: 20px;
-    font-size: 11px; background: rgba(0,123,255,.08); color: #007bff;
-    border: 1px solid rgba(0,123,255,.2); margin: 2px;
+  @media (max-width: 900px) {
+    .stat-grid, .feature-list, .settings-grid { grid-template-columns: 1fr; }
+    .hero-title { font-size: 1.8rem; }
   }
-  .sql-block { background: #f8f9fa; border-radius: 8px; padding: 12px;
-    font-family: 'DM Mono', monospace; font-size: 13px; color: #007bff;
-    border: 1px solid #dee2e6; white-space: pre-wrap; word-break: break-all; }
-  .bill-field { background: #ffffff; border-radius: 6px; padding: 10px 14px; margin: 4px 0;
-    border: 1px solid #dee2e6; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-  .bill-field .lbl { font-size: 10px; text-transform: uppercase; color: #6c757d; }
-  .bill-field .val { font-size: 14px; color: #212529; font-family: monospace; }
-  .warning-box { background: rgba(255,193,7,.08); border: 1px solid rgba(255,193,7,.3);
-    border-radius: 8px; padding: 12px; color: #856404; font-size: 13px; }
-  hr { border-color: #dee2e6 !important; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
+def render_hero():
+    st.markdown("""
+    <div class="hero-card">
+      <div class="hero-kicker">ShopOS Control Room</div>
+      <div class="hero-title">Run sales questions, policy search, and invoice analysis from one calm workspace.</div>
+      <p class="hero-copy">
+        Ask in plain English, upload bills or PDFs, and move between shop operations,
+        analytics, and document analysis without losing context.
+      </p>
+      <div class="stat-grid">
+        <div class="stat-card">
+          <div class="stat-label">Agents</div>
+          <div class="stat-value">5 specialist routes</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Knowledge</div>
+          <div class="stat-value">SQL + RAG + Vision</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Documents</div>
+          <div class="stat-value">Images and PDFs</div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 with st.sidebar:
+    st.markdown("""
+    <div class="sidebar-panel">
+      <div class="sidebar-title">Workspace</div>
+      <div class="sidebar-big">ShopOS</div>
+      <div class="mini-note">AI operations assistant for accounts, documents, and policy search.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="sidebar-panel">
+      <div class="sidebar-title">Status</div>
+      <div class="sidebar-big">Online and Ready</div>
+      <div class="mini-note">Supervisor, analytics, SQL, bill, and RAG routes are available.</div>
+    </div>
+    """, unsafe_allow_html=True)
     st.markdown("## 🏪 ShopOS")
     st.markdown("*AI Assistant with Document Analysis*")
     st.divider()
@@ -162,6 +260,23 @@ if page == "🤖 AI Assistant":
     </div>
     """, unsafe_allow_html=True)
 
+    render_hero()
+    st.markdown("""
+    <div class="surface-card">
+      <div class="surface-title">Operations chat built for real shop workflows</div>
+      <p class="surface-copy">
+        Ask about balances, sales, inventory, returns, or uploaded invoices. The assistant routes
+        the request to the best specialist instead of forcing everything through one generic path.
+      </p>
+      <div class="feature-list">
+        <div class="feature-pill">Natural language database questions</div>
+        <div class="feature-pill">Policy and terms search with RAG</div>
+        <div class="feature-pill">Bill analysis from images and PDFs</div>
+        <div class="feature-pill">Inventory and overdue invoice monitoring</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
     # Session state for chat history
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -177,6 +292,16 @@ if page == "🤖 AI Assistant":
         <p style="color: #bf360c; margin: 5px 0 0 0; text-align: center; font-size: 14px;">
             Supports images (JPG, PNG, WebP) and PDF documents
         </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="surface-card">
+      <div class="surface-title">Document intake</div>
+      <p class="surface-copy">
+        Upload a bill, invoice, or receipt to extract key fields and get a short operational summary.
+        Images and PDFs are both supported.
+      </p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -223,6 +348,15 @@ if page == "🤖 AI Assistant":
 
     # Enhanced suggestion chips with better styling
     st.markdown("### 💡 Quick Actions")
+    st.markdown("""
+    <div class="surface-card">
+      <div class="surface-title">Quick prompts</div>
+      <p class="surface-copy">
+        Use one of these shortcuts to jump into a common operational task.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
     suggestions = [
         "📊 Show me sales summary for this month",
         "👥 Who are the top 5 customers by revenue?",
@@ -344,6 +478,37 @@ elif page == "⚙️ Settings":
 
     # ── RAG / Vector Store management ─────────────────────────────
     st.subheader("📚 RAG Vector Store")
+
+    st.markdown("""
+    <div class="hero-card">
+      <div class="hero-kicker">System Desk</div>
+      <div class="hero-title">Settings, diagnostics, and knowledge-store maintenance.</div>
+      <p class="hero-copy">
+        Check the vector index, review tracing status, inspect the database, and manage the
+        operational scaffolding behind the assistant.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown("""
+    <div class="settings-grid">
+      <div class="settings-tile">
+        <strong>Vector store controls</strong>
+        <span>Rebuild or clear embeddings when the knowledge base changes.</span>
+      </div>
+      <div class="settings-tile">
+        <strong>Tracing visibility</strong>
+        <span>Check whether LangSmith observability is configured for this environment.</span>
+      </div>
+      <div class="settings-tile">
+        <strong>Database health</strong>
+        <span>Inspect available tables, row counts, and current schema details.</span>
+      </div>
+      <div class="settings-tile">
+        <strong>Architecture reference</strong>
+        <span>Keep the routing model and tool graph visible while debugging.</span>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     from rag.rag_pipeline import is_indexed
 
