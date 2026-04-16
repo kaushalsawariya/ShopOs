@@ -16,6 +16,8 @@ tiktoken
 sqlalchemy
 
 Pillow
+pdf2image
+PyPDF2
 
 streamlit
 streamlit-chat

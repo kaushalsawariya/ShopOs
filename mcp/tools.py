@@ -7,7 +7,7 @@ These are the "capabilities" registered with the LangGraph agent.
 Tools available:
   query_database       — Text-to-SQL on shop data
   search_policies      — RAG over T&C documents
-  analyze_bill_image   — GPT-4o Vision bill extraction (RAG-augmented)
+  analyze_bill_file    — GPT-4o Vision bill extraction (RAG-augmented, supports images & PDFs)
   get_customer_summary — Full customer profile from DB
   get_sales_summary    — Aggregated sales analytics
   check_overdue_invoices — Overdue/pending invoice list
@@ -34,63 +34,9 @@ def query_database(question: str) -> str:
     Use for questions about customers, sales, products, invoices, expenses, suppliers.
     Example: 'What are the top 5 customers by total sales?'
     """
-    from db.database import engine, get_table_schema
-    from guardrails.guardrails import validate_sql, sanitize_output
-    from langchain_openai import ChatOpenAI
-    from langchain_core.messages import SystemMessage, HumanMessage
-    from sqlalchemy import text as sa_text
-
-    schema = get_table_schema()
-    llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-                     temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-
-    # Generate SQL
-    system = f"""You are an expert SQLite assistant.
-Convert the user's question into a single SELECT query.
-Return ONLY the SQL — no markdown, no backticks, no explanation.
-
-DATABASE SCHEMA:
-{schema}
-
-RULES:
-- Only SELECT queries
-- Use JOINs when needed
-- Alias columns clearly
-- Limit to 50 rows unless user asks for more
-"""
-    sql = llm.invoke([SystemMessage(content=system),
-                      HumanMessage(content=question)]).content.strip()
-    sql = sql.replace("```sql","").replace("```","").strip()
-
-    # Guardrail — validate SQL
-    safe, reason = validate_sql(sql)
-    if not safe:
-        return f"Query blocked by guardrail: {reason}"
-
-    # Execute
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(sa_text(sql)).fetchall()
-            if not rows:
-                return f"SQL: {sql}\nResult: No records found."
-            cols = list(rows[0]._fields)
-            data = [dict(zip(cols, r)) for r in rows]
-
-        # Generate plain-English explanation
-        explanation = llm.invoke([
-            HumanMessage(content=
-                f"Question: {question}\nSQL: {sql}\nResults (first 5): {data[:5]}\n"
-                "Explain results in 2–3 sentences using ₹ for currency."
-            )
-        ]).content
-
-        return sanitize_output(
-            f"SQL: {sql}\n\nRows returned: {len(data)}\n\n"
-            f"Explanation: {explanation}\n\n"
-            f"Data: {json.dumps(data[:20], default=str)}"
-        )
-    except Exception as e:
-        return f"Query execution error: {e}\nSQL attempted: {sql}"
+    from core.sql_handler import SQLHandler
+    handler = SQLHandler()
+    return handler.query(question)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -104,8 +50,9 @@ def search_policies(query: str) -> str:
     Use when asked about policies, returns, warranties, payment methods, discounts.
     Example: 'What is the return policy for electronics?'
     """
-    from rag.rag_pipeline import answer_rag_query
-    result = answer_rag_query(query)
+    from core.rag_handler import RAGHandler
+    handler = RAGHandler()
+    result = handler.query(query)
     if result["error"]:
         return f"Policy search error: {result['error']}"
     sources_str = ", ".join(result["sources"]) if result["sources"] else "Shop policies"
@@ -113,102 +60,21 @@ def search_policies(query: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# TOOL 3 — Bill / Invoice Image Analysis (RAG-augmented)
+# TOOL 3 — Bill / Invoice Analysis (Images & PDFs)
 # ══════════════════════════════════════════════════════════════
 @tool
-def analyze_bill_image(image_base64: str, filename: str = "bill.jpg") -> str:
+def analyze_bill_file(file_base64: str, filename: str = "bill.jpg") -> str:
     """
-    Analyse a bill or invoice image using GPT-4o Vision.
+    Analyse a bill or invoice file (image or PDF) using GPT-4o Vision.
+    For PDFs, converts pages to images first, then analyzes the content.
     RAG context about invoice structure and billing terms is retrieved first
     to make the extraction more accurate.
-    Input: base64-encoded image string.
+    Input: base64-encoded file string (image or PDF).
     Returns: structured extracted data + analysis.
     """
-    from langchain_openai import ChatOpenAI
-    from langchain_core.messages import HumanMessage
-    from rag.rag_pipeline import get_bill_context
-    from guardrails.guardrails import sanitize_output
-    import json, pathlib
-
-    # 1. Retrieve billing context from RAG vector store
-    bill_context = get_bill_context()
-
-    # 2. Build extraction prompt augmented with RAG context
-    extraction_prompt = f"""You are an expert invoice reader for an Indian shop.
-Use the billing knowledge below to accurately extract all fields.
-
-BILLING KNOWLEDGE (from shop policy documents):
-{bill_context}
-
-Extract ALL fields from the bill image and return a JSON object with:
-{{
-  "invoice_number": "string or null",
-  "vendor_name": "string or null",
-  "customer_name": "string or null",
-  "date": "YYYY-MM-DD or null",
-  "due_date": "YYYY-MM-DD or null",
-  "items": [{{"description":"","qty":0,"unit_price":0,"amount":0}}],
-  "subtotal": 0,
-  "cgst": 0,
-  "sgst": 0,
-  "igst": 0,
-  "discount": 0,
-  "total_amount": 0,
-  "payment_method": "string or null",
-  "payment_status": "paid/pending/partial/overdue or null",
-  "currency": "INR",
-  "notes": "string or null"
-}}
-
-Return ONLY the JSON — no markdown, no backticks."""
-
-    vision_llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-        temperature=0, max_tokens=1500,
-        api_key=os.getenv("OPENAI_API_KEY")
-    )
-
-    # Determine media type from filename
-    ext = pathlib.Path(filename).suffix.lower()
-    media_type = {"jpg":"image/jpeg","jpeg":"image/jpeg",
-                  "png":"image/png","webp":"image/webp"}.get(ext.lstrip("."), "image/jpeg")
-
-    try:
-        msg = HumanMessage(content=[
-            {"type": "image_url",
-             "image_url": {"url": f"data:{media_type};base64,{image_base64}", "detail": "high"}},
-            {"type": "text", "text": extraction_prompt},
-        ])
-        raw = vision_llm.invoke([msg]).content.strip()
-        raw = raw.replace("```json","").replace("```","").strip()
-        extracted = json.loads(raw)
-    except json.JSONDecodeError:
-        extracted = {"error": "Could not parse JSON from image", "raw": raw}
-    except Exception as e:
-        return f"Bill analysis error: {e}"
-
-    # 3. Generate human-readable analysis
-    analysis_prompt = f"""Based on this extracted bill data, provide a concise 3–5 sentence analysis:
-{json.dumps(extracted, indent=2)}
-
-Cover: what the bill is for, key amounts (subtotal/tax/total), payment status,
-and any notable items or concerns. Use ₹ for Indian Rupee amounts."""
-
-    analysis = vision_llm.invoke([HumanMessage(content=analysis_prompt)]).content
-
-    # Save bill image to disk for record keeping
-    try:
-        pathlib.Path("./data/bills").mkdir(parents=True, exist_ok=True)
-        img_bytes = base64.b64decode(image_base64)
-        with open(f"./data/bills/{filename}", "wb") as f:
-            f.write(img_bytes)
-    except Exception:
-        pass
-
-    return sanitize_output(
-        f"EXTRACTED DATA:\n{json.dumps(extracted, indent=2)}\n\n"
-        f"ANALYSIS:\n{analysis}"
-    )
+    from core.bill_analyzer import BillAnalyzer
+    analyzer = BillAnalyzer()
+    return analyzer.analyze_bill(file_base64, filename)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -349,7 +215,7 @@ def get_low_stock_alerts() -> str:
 ALL_TOOLS = [
     query_database,
     search_policies,
-    analyze_bill_image,
+    analyze_bill_file,
     get_customer_summary,
     get_sales_summary,
     check_overdue_invoices,

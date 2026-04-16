@@ -36,7 +36,7 @@ from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
 
 from mcp.tools import (
-    query_database, search_policies, analyze_bill_image,
+    query_database, search_policies, analyze_bill_file,
     get_customer_summary, get_sales_summary,
     check_overdue_invoices, get_low_stock_alerts, ALL_TOOLS
 )
@@ -51,6 +51,7 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], lambda x, y: x + y]  # append-only
     next_agent: str       # which agent to route to next
     final_answer: str     # accumulated final response
+    file_base64: str | None  # base64 encoded file data for bill analysis
 
 
 # ── Helper: build an LLM bound to specific tools ────────────────────────────
@@ -65,18 +66,15 @@ def make_llm(tools: list = None):
 # NODE: SUPERVISOR
 # Reads user message and routes to the right specialist agent.
 # ══════════════════════════════════════════════════════════════════
-SUPERVISOR_SYSTEM = """You are a supervisor for a shop accounts management system.
-Your job is to read the user's request and route it to the most appropriate specialist agent.
+SUPERVISOR_SYSTEM = """Route user requests to the right agent:
 
-Available agents:
-- sql_agent      : Questions about sales data, customers, invoices, products, expenses, stock
-- rag_agent      : Questions about policies, return policy, warranty, credit terms, payment terms
-- bill_agent     : Analysing uploaded bill/invoice images
-- analytics_agent: Dashboard stats, sales summaries, overdue invoices, low stock alerts
-- general_agent  : General greetings, clarifications, or multi-part questions
+- sql_agent: sales, customers, invoices, products, expenses, stock
+- rag_agent: policies, returns, warranties, credit terms, payments
+- bill_agent: uploaded bill/invoice files (images/PDFs)
+- analytics_agent: summaries, overdue invoices, low stock, dashboard
+- general_agent: greetings, clarifications, multi-part questions
 
-Respond with ONLY one of: sql_agent, rag_agent, bill_agent, analytics_agent, general_agent
-"""
+Respond with ONLY the agent name."""
 
 def supervisor_node(state: AgentState) -> AgentState:
     """Routes the conversation to the appropriate specialist."""
@@ -107,10 +105,7 @@ def supervisor_router(state: AgentState) -> str:
 # ══════════════════════════════════════════════════════════════════
 # NODE: SQL AGENT — handles data queries
 # ══════════════════════════════════════════════════════════════════
-SQL_SYSTEM = """You are an expert shop data analyst.
-Answer the user's question by using the query_database or get_customer_summary tool.
-Always use tools to get real data — never make up numbers.
-Format currency as ₹ (Indian Rupee). Keep the answer concise and clear."""
+SQL_SYSTEM = """Use query_database or get_customer_summary tools for real data. Format currency as ₹. Be concise."""
 
 def sql_agent_node(state: AgentState) -> AgentState:
     llm = make_llm([query_database, get_customer_summary])
@@ -121,10 +116,7 @@ def sql_agent_node(state: AgentState) -> AgentState:
 # ══════════════════════════════════════════════════════════════════
 # NODE: RAG AGENT — handles policy questions
 # ══════════════════════════════════════════════════════════════════
-RAG_SYSTEM = """You are a shop policy expert.
-Answer questions about return policies, warranties, credit terms, and payment policies
-by using the search_policies tool.
-Always search before answering. Quote relevant policy sections."""
+RAG_SYSTEM = """Use search_policies tool for return policies, warranties, credit terms, payment policies. Quote relevant sections."""
 
 def rag_agent_node(state: AgentState) -> AgentState:
     llm = make_llm([search_policies])
@@ -133,14 +125,33 @@ def rag_agent_node(state: AgentState) -> AgentState:
 
 
 # ══════════════════════════════════════════════════════════════════
-# NODE: BILL AGENT — handles bill image analysis
+# NODE: BILL AGENT — handles bill/invoice analysis (images & PDFs)
 # ══════════════════════════════════════════════════════════════════
 BILL_SYSTEM = """You are an expert at analysing bills and invoices.
-When an image is provided (as base64 in the message), use analyze_bill_image to extract data.
+When a file is provided (as base64 in the message), use analyze_bill_file to extract data.
+This works for both images (JPG, PNG, WebP) and PDFs.
 Present the extracted information clearly with all amounts in ₹."""
 
 def bill_agent_node(state: AgentState) -> AgentState:
-    llm = make_llm([analyze_bill_image])
+    # Create a custom tool that has access to the file data
+    from mcp.tools import analyze_bill_file
+
+    # Bind the file data to the tool
+    file_base64 = state.get("file_base64", "")
+    if file_base64:
+        # Create a tool instance with the file data
+        def analyze_bill_with_data(filename: str = "bill.jpg") -> str:
+            from core.bill_analyzer import BillAnalyzer
+            analyzer = BillAnalyzer()
+            return analyzer.analyze_bill(file_base64, filename)
+
+        # Create a tool from the function
+        from langchain_core.tools import tool
+        analyze_bill_tool = tool(analyze_bill_with_data)
+        llm = make_llm([analyze_bill_tool])
+    else:
+        llm = make_llm([analyze_bill_file])
+
     response = llm.invoke([SystemMessage(content=BILL_SYSTEM)] + state["messages"])
     return {**state, "messages": [response]}
 
@@ -255,7 +266,7 @@ def get_graph():
 def run_agent(
     user_message: str,
     history: list[dict] | None = None,
-    image_base64: str | None = None,
+    file_base64: str | None = None,
 ) -> dict:
     """
     Run the multi-agent graph for one user turn.
@@ -263,7 +274,7 @@ def run_agent(
     Args:
         user_message : Plain text from the user
         history      : List of {"role": "user"/"assistant", "content": "..."} dicts
-        image_base64 : Optional base64-encoded bill image
+        file_base64  : Optional base64-encoded bill file (image or PDF)
 
     Returns:
         {
@@ -287,16 +298,19 @@ def run_agent(
         elif h["role"] == "assistant":
             messages.append(AIMessage(content=h["content"]))
 
-    # Attach image to message if provided
-    if image_base64:
-        # Signal the bill agent via a structured message
+    # Attach file to message if provided
+    if file_base64:
+        # Signal the bill agent via a structured message (don't include base64 in history)
         content = [
             {"type": "text",
-             "text": f"{user_message}\n\n[IMAGE_BASE64]:{image_base64}"},
+             "text": f"{user_message}\n\n[FILE_ATTACHED]: Document uploaded for analysis"},
         ]
         messages.append(HumanMessage(content=content))
+        # Store file_base64 separately for the bill agent
+        file_data = file_base64
     else:
         messages.append(HumanMessage(content=user_message))
+        file_data = None
 
     # ── Run the graph ────────────────────────────────────────────
     try:
@@ -304,6 +318,7 @@ def run_agent(
             "messages": messages,
             "next_agent": "general_agent",
             "final_answer": "",
+            "file_base64": file_data,
         }
         result = get_graph().invoke(initial_state)
 

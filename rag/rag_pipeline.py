@@ -151,23 +151,9 @@ def answer_rag_query(query: str, k: int = 4) -> Dict[str, Any]:
     Full RAG chain for policy questions.
     Returns: { answer, sources, chunks_used, error }
     """
-    try:
-        docs = search(query, k=k)
-        context = "\n\n---\n".join(
-            f"[{d.metadata.get('title','Doc')}]\n{d.page_content}" for d in docs
-        )
-        chain = (
-            {"context": lambda _: context, "question": RunnablePassthrough()}
-            | POLICY_PROMPT
-            | llm
-            | StrOutputParser()
-        )
-        answer = chain.invoke(query)
-        sources = list({d.metadata.get("title", "Unknown") for d in docs})
-        return {"answer": answer, "sources": sources,
-                "chunks_used": len(docs), "error": None}
-    except Exception as e:
-        return {"answer": "", "sources": [], "chunks_used": 0, "error": str(e)}
+    from core.rag_handler import RAGHandler
+    handler = RAGHandler()
+    return handler.query(query, k)
 
 
 def get_bill_context(task_description: str = "Extract all invoice fields") -> str:
