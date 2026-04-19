@@ -6,7 +6,7 @@ Database engine, session, and schema-extraction helpers.
 import os
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 
@@ -16,11 +16,8 @@ LEGACY_DATABASE_URL = "sqlite:///./data/shop_accounts.db"
 
 
 def _default_data_root() -> Path:
-    """Prefer a stable local app-data folder on Windows over OneDrive-synced paths."""
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if os.name == "nt" and local_app_data:
-        return Path(local_app_data) / "ShopOS"
-    return Path("./data")
+    """Keep the default app data inside the project workspace unless overridden."""
+    return Path(os.getenv("SHOPOS_DATA_DIR", "./data/runtime")).resolve()
 
 
 def _resolve_database_url() -> str:
@@ -47,6 +44,15 @@ engine = create_engine(
     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
     echo=False,
 )
+
+if "sqlite" in DATABASE_URL:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=MEMORY")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.close()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

@@ -1,6 +1,6 @@
 """
 db/models.py
-SQLAlchemy ORM models — customers, products, sales, invoices, suppliers, expenses, T&C
+SQLAlchemy ORM models for business data, users, and memory.
 """
 
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text, Boolean, Date
@@ -26,6 +26,57 @@ class Customer(Base):
     created_at       = Column(DateTime, default=datetime.utcnow)
     sales            = relationship("Sale", back_populates="customer")
     invoices         = relationship("Invoice", back_populates="customer")
+
+
+class User(Base):
+    """Application user that can sign in to the assistant."""
+    __tablename__ = "users"
+    id                = Column(Integer, primary_key=True)
+    full_name         = Column(String(100), nullable=False)
+    email             = Column(String(120), unique=True, nullable=False)
+    password_hash     = Column(String(255), nullable=False)
+    preferred_agent   = Column(String(50), default="general_agent")
+    created_at        = Column(DateTime, default=datetime.utcnow)
+    sessions          = relationship("AuthSession", back_populates="user", cascade="all, delete-orphan")
+    short_term_memory = relationship("ShortTermMemory", back_populates="user", cascade="all, delete-orphan")
+    long_term_memory  = relationship("LongTermMemory", back_populates="user", cascade="all, delete-orphan")
+
+
+class AuthSession(Base):
+    """Simple persistent session token store for login/signup."""
+    __tablename__ = "auth_sessions"
+    id                = Column(Integer, primary_key=True)
+    user_id           = Column(Integer, ForeignKey("users.id"), nullable=False)
+    token             = Column(String(255), unique=True, nullable=False)
+    created_at        = Column(DateTime, default=datetime.utcnow)
+    last_seen_at      = Column(DateTime, default=datetime.utcnow)
+    revoked           = Column(Boolean, default=False)
+    user              = relationship("User", back_populates="sessions")
+
+
+class ShortTermMemory(Base):
+    """Per-session conversation memory used for recent context."""
+    __tablename__ = "short_term_memory"
+    id                = Column(Integer, primary_key=True)
+    user_id           = Column(Integer, ForeignKey("users.id"), nullable=False)
+    session_token     = Column(String(255), nullable=False)
+    role              = Column(String(20), nullable=False)
+    content           = Column(Text, nullable=False)
+    route             = Column(String(50))
+    created_at        = Column(DateTime, default=datetime.utcnow)
+    user              = relationship("User", back_populates="short_term_memory")
+
+
+class LongTermMemory(Base):
+    """Stable user preferences and durable insights extracted from chats."""
+    __tablename__ = "long_term_memory"
+    id                = Column(Integer, primary_key=True)
+    user_id           = Column(Integer, ForeignKey("users.id"), nullable=False)
+    category          = Column(String(50), default="preference")
+    summary           = Column(Text, nullable=False)
+    source_excerpt    = Column(Text)
+    updated_at        = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    user              = relationship("User", back_populates="long_term_memory")
 
 
 class Supplier(Base):

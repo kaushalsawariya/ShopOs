@@ -1,4 +1,9 @@
+"""
+agents/graph.py
+LangGraph-based ShopOS assistant with planning and reflection hooks.
+"""
 
+from __future__ import annotations
 
 import os
 from typing import Annotated, TypedDict
@@ -9,40 +14,90 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from mcp.tools import (
-    query_database, search_policies, analyze_bill_file,
-    get_customer_summary, get_sales_summary,
-    check_overdue_invoices, get_low_stock_alerts, ALL_TOOLS
-)
+from db.database import SessionLocal
 from guardrails.guardrails import run_guardrails, sanitize_output
+from mcp.tools import (
+    ALL_TOOLS,
+    analyze_bill_file,
+    check_overdue_invoices,
+    get_customer_summary,
+    get_low_stock_alerts,
+    get_sales_summary,
+    query_database,
+    search_policies,
+)
+from services.memory import build_memory_context, extract_reflection_note, remember_turn, upsert_long_term_memory
 
 load_dotenv()
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+VALID_AGENTS = {"sql_agent", "rag_agent", "bill_agent", "analytics_agent", "general_agent"}
 
-# ── Shared graph state ────────────────────────────────────────────────────────
+
 class AgentState(TypedDict):
-    messages: Annotated[list[BaseMessage], lambda x, y: x + y]  # append-only
-    next_agent: str       # which agent to route to next
-    current_agent: str    # agent currently handling the turn
-    final_answer: str     # accumulated final response
-    file_base64: str | None  # base64 encoded file data for bill analysis
-    file_name: str | None    # uploaded file name
+    messages: Annotated[list[BaseMessage], lambda x, y: x + y]
+    next_agent: str
+    current_agent: str
+    final_answer: str
+    file_base64: str | None
+    file_name: str | None
+    user_id: int | None
+    session_token: str | None
+    memory_context: dict
+    plan: str
+    reflection: str
 
 
-# ── Helper: build an LLM bound to specific tools ────────────────────────────
-def make_llm(tools: list = None):
+def make_llm(tools: list | None = None):
     llm = ChatOpenAI(model=MODEL, temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-    if tools:
-        return llm.bind_tools(tools)
-    return llm
+    return llm.bind_tools(tools) if tools else llm
 
 
-# ══════════════════════════════════════════════════════════════════
-# NODE: SUPERVISOR
-# Reads user message and routes to the right specialist agent.
-# ══════════════════════════════════════════════════════════════════
-SUPERVISOR_SYSTEM = """Route user requests to the right agent:
+def format_memory_context(memory_context: dict) -> str:
+    short_term = memory_context.get("short_term", [])
+    long_term = memory_context.get("long_term", [])
+    short_block = "\n".join(
+        f"- {item['role']}: {item['content'][:160]}"
+        for item in short_term
+    ) or "- No recent session memory."
+    long_block = "\n".join(
+        f"- {item['category']}: {item['summary'][:160]}"
+        for item in long_term
+    ) or "- No durable user memory."
+    return f"Recent memory:\n{short_block}\n\nLong-term memory:\n{long_block}"
+
+
+def infer_preferred_agent(user_text: str, has_file: bool) -> str:
+    if has_file:
+        return "bill_agent"
+    text = user_text.lower()
+    if any(word in text for word in ["policy", "return", "warranty", "payment terms"]):
+        return "rag_agent"
+    if any(word in text for word in ["summary", "dashboard", "overdue", "stock", "inventory"]):
+        return "analytics_agent"
+    if any(word in text for word in ["customer", "sale", "sales", "invoice", "product", "balance"]):
+        return "sql_agent"
+    return "general_agent"
+
+
+def build_plan(state: AgentState) -> str:
+    last_human = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+    last_text = str(last_human.content) if last_human else ""
+    preferred = infer_preferred_agent(last_text, bool(state.get("file_base64")))
+    steps = [
+        "1. Read the latest request and any saved memory.",
+        f"2. Start with {preferred} unless the request clearly needs another specialist.",
+        "3. Use tools only when they add real shop data or document evidence.",
+        "4. Keep the answer concise and operationally useful.",
+    ]
+    return "\n".join(steps)
+
+
+def planner_node(state: AgentState) -> AgentState:
+    return {**state, "plan": build_plan(state)}
+
+
+SUPERVISOR_SYSTEM = """Route user requests to the right agent.
 
 - sql_agent: sales, customers, invoices, products, expenses, stock
 - rag_agent: policies, returns, warranties, credit terms, payments
@@ -50,67 +105,65 @@ SUPERVISOR_SYSTEM = """Route user requests to the right agent:
 - analytics_agent: summaries, overdue invoices, low stock, dashboard
 - general_agent: greetings, clarifications, multi-part questions
 
+Consider the plan and memory context.
 Respond with ONLY the agent name."""
 
+
 def supervisor_node(state: AgentState) -> AgentState:
-    """Routes the conversation to the appropriate specialist."""
     if state.get("file_base64"):
-        return {**state, "next_agent": "bill_agent"} 
-    #  If no file, use LLM to route based on message content
+        return {**state, "next_agent": "bill_agent"}
 
     llm = make_llm()
-    # Get the last human message for routing decision
-    last_msg = next((m for m in reversed(state["messages"])
-                     if isinstance(m, HumanMessage)), None)
+    last_msg = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
     if not last_msg:
         return {**state, "next_agent": "general_agent"}
 
-    resp = llm.invoke([
+    prompt = [
         SystemMessage(content=SUPERVISOR_SYSTEM),
+        SystemMessage(content=f"Plan:\n{state.get('plan', '')}"),
+        SystemMessage(content=format_memory_context(state.get("memory_context", {}))),
         HumanMessage(content=str(last_msg.content)),
-    ])
+    ]
+    resp = llm.invoke(prompt)
     agent = resp.content.strip().lower()
-    # Validate — fall back to general if unexpected
-    valid = {"sql_agent","rag_agent","bill_agent","analytics_agent","general_agent"}
-    if agent not in valid:
-        agent = "general_agent"
-    return {**state, "next_agent": agent}
+    return {**state, "next_agent": agent if agent in VALID_AGENTS else "general_agent"}
 
 
 def supervisor_router(state: AgentState) -> str:
-    """Edge function: returns which agent to execute next."""
     return state["next_agent"]
 
 
-# ══════════════════════════════════════════════════════════════════
-# NODE: SQL AGENT — handles data queries
-# ══════════════════════════════════════════════════════════════════
-SQL_SYSTEM = """Use query_database or get_customer_summary tools for real data. Format currency as Rs. Be concise."""
+def compose_system_prompt(base_prompt: str, state: AgentState) -> list[SystemMessage]:
+    return [
+        SystemMessage(content=base_prompt),
+        SystemMessage(content=f"Execution plan:\n{state.get('plan', '')}"),
+        SystemMessage(content=format_memory_context(state.get("memory_context", {}))),
+    ]
+
+
+def invoke_agent(state: AgentState, system_prompt: str, tools: list, agent_name: str) -> AgentState:
+    llm = make_llm(tools)
+    response = llm.invoke(compose_system_prompt(system_prompt, state) + state["messages"])
+    return {**state, "messages": [response], "current_agent": agent_name}
+
 
 def sql_agent_node(state: AgentState) -> AgentState:
-    llm = make_llm([query_database, get_customer_summary])
-    response = llm.invoke([SystemMessage(content=SQL_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response], "current_agent": "sql_agent"}
+    return invoke_agent(
+        state,
+        "Use query_database or get_customer_summary for real data. Format currency as Rs. Be concise.",
+        [query_database, get_customer_summary],
+        "sql_agent",
+    )
 
-
-# ══════════════════════════════════════════════════════════════════
-# NODE: RAG AGENT — handles policy questions
-# ══════════════════════════════════════════════════════════════════
-RAG_SYSTEM = """Use search_policies for return policies, warranties, credit terms, and payment policies."""
 
 def rag_agent_node(state: AgentState) -> AgentState:
-    llm = make_llm([search_policies])
-    response = llm.invoke([SystemMessage(content=RAG_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response], "current_agent": "rag_agent"}
+    return invoke_agent(
+        state,
+        "Use search_policies for return policies, warranties, credit terms, and payment policies.",
+        [search_policies],
+        "rag_agent",
+    )
 
-
-# ══════════════════════════════════════════════════════════════════
-# NODE: BILL AGENT — handles bill/invoice analysis (images & PDFs)
-# ══════════════════════════════════════════════════════════════════
-BILL_SYSTEM = """You are an expert at analysing bills and invoices.
-When a file is provided (as base64 in the message), use analyze_bill_file to extract data.
-This works for both images (JPG, PNG, WebP) and PDFs.
-Present the extracted information clearly with all amounts in ₹."""
 
 def bill_agent_node(state: AgentState) -> AgentState:
     file_base64 = state.get("file_base64")
@@ -125,122 +178,109 @@ def bill_agent_node(state: AgentState) -> AgentState:
             "current_agent": "bill_agent",
         }
 
-    llm = make_llm([analyze_bill_file])
-    response = llm.invoke([SystemMessage(content=BILL_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response], "current_agent": "bill_agent"}
+    return invoke_agent(
+        state,
+        (
+            "You are an expert at analysing bills and invoices. "
+            "Use analyze_bill_file when a file is provided and present extracted information clearly."
+        ),
+        [analyze_bill_file],
+        "bill_agent",
+    )
 
-
-# ══════════════════════════════════════════════════════════════════
-# NODE: ANALYTICS AGENT — handles dashboard/summary queries
-# ══════════════════════════════════════════════════════════════════
-ANALYTICS_SYSTEM = """You are a shop analytics specialist.
-Use the available tools to fetch real-time shop analytics:
-- get_sales_summary for revenue and transaction stats
-- check_overdue_invoices for outstanding payments
-- get_low_stock_alerts for inventory alerts
-Present data with clear formatting and ₹ for currency."""
 
 def analytics_agent_node(state: AgentState) -> AgentState:
-    llm = make_llm([get_sales_summary, check_overdue_invoices, get_low_stock_alerts])
-    response = llm.invoke([SystemMessage(content=ANALYTICS_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response], "current_agent": "analytics_agent"}
+    return invoke_agent(
+        state,
+        (
+            "You are a shop analytics specialist. Use get_sales_summary, "
+            "check_overdue_invoices, and get_low_stock_alerts for real data."
+        ),
+        [get_sales_summary, check_overdue_invoices, get_low_stock_alerts],
+        "analytics_agent",
+    )
 
-
-# ══════════════════════════════════════════════════════════════════
-# NODE: GENERAL AGENT — handles everything else
-# ══════════════════════════════════════════════════════════════════
-GENERAL_SYSTEM = """You are a helpful AI assistant for a shop accounts management system.
-You can access all shop tools when needed. Be friendly, concise, and professional.
-For greetings or clarifications, respond directly without using tools."""
 
 def general_agent_node(state: AgentState) -> AgentState:
-    llm = make_llm(ALL_TOOLS)
-    response = llm.invoke([SystemMessage(content=GENERAL_SYSTEM)] + state["messages"])
-    return {**state, "messages": [response], "current_agent": "general_agent"}
+    return invoke_agent(
+        state,
+        "You are a helpful AI assistant for a shop accounts management system.",
+        ALL_TOOLS,
+        "general_agent",
+    )
 
 
-# ══════════════════════════════════════════════════════════════════
-# NODE: TOOL EXECUTOR (shared across all agents)
-# ══════════════════════════════════════════════════════════════════
 tool_node = ToolNode(ALL_TOOLS)
 
 
 def should_continue(state: AgentState) -> str:
-    """
-    After any agent runs, check if it made tool calls.
-    If yes → run tools. If no → we're done.
-    """
     last_msg = state["messages"][-1]
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
         return "tools"
-    return END
+    return "reflect"
 
 
 def route_back_to_current_agent(state: AgentState) -> str:
     current_agent = state.get("current_agent", "general_agent")
-    valid = {"sql_agent", "rag_agent", "bill_agent", "analytics_agent", "general_agent"}
-    return current_agent if current_agent in valid else "general_agent"
+    return current_agent if current_agent in VALID_AGENTS else "general_agent"
 
 
-# ══════════════════════════════════════════════════════════════════
-# BUILD THE GRAPH
-# ══════════════════════════════════════════════════════════════════
+def reflect_node(state: AgentState) -> AgentState:
+    final_msg = next(
+        (m for m in reversed(state["messages"]) if isinstance(m, AIMessage) and m.content),
+        None,
+    )
+    reflection = "No durable insight extracted."
+    if final_msg and state.get("user_id") and state.get("session_token"):
+        last_human = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
+        insight = extract_reflection_note(str(last_human.content), str(final_msg.content)) if last_human else None
+        if insight:
+            with SessionLocal() as db:
+                upsert_long_term_memory(db, state["user_id"], insight)
+            reflection = insight["summary"]
+    return {**state, "reflection": reflection, "final_answer": str(final_msg.content) if final_msg else ""}
+
+
 def build_graph() -> StateGraph:
-    """
-    Builds and compiles the LangGraph multi-agent supervisor graph.
-    """
     graph = StateGraph(AgentState)
+    graph.add_node("planner", planner_node)
+    graph.add_node("supervisor", supervisor_node)
+    graph.add_node("sql_agent", sql_agent_node)
+    graph.add_node("rag_agent", rag_agent_node)
+    graph.add_node("bill_agent", bill_agent_node)
+    graph.add_node("analytics_agent", analytics_agent_node)
+    graph.add_node("general_agent", general_agent_node)
+    graph.add_node("tools", tool_node)
+    graph.add_node("reflect", reflect_node)
 
-    # Add all nodes
-    graph.add_node("supervisor",       supervisor_node)
-    graph.add_node("sql_agent",        sql_agent_node)
-    graph.add_node("rag_agent",        rag_agent_node)
-    graph.add_node("bill_agent",       bill_agent_node)
-    graph.add_node("analytics_agent",  analytics_agent_node)
-    graph.add_node("general_agent",    general_agent_node)
-    graph.add_node("tools",            tool_node)
-
-    # Entry point: always start at supervisor
-    graph.add_edge(START, "supervisor")
-
-    # Supervisor routes to one of the specialist agents
+    graph.add_edge(START, "planner")
+    graph.add_edge("planner", "supervisor")
     graph.add_conditional_edges(
         "supervisor",
         supervisor_router,
-        {
-            "sql_agent":       "sql_agent",
-            "rag_agent":       "rag_agent",
-            "bill_agent":      "bill_agent",
-            "analytics_agent": "analytics_agent",
-            "general_agent":   "general_agent",
-        }
-    )
-
-    # Each agent may call tools or finish
-    for agent in ["sql_agent","rag_agent","bill_agent","analytics_agent","general_agent"]:
-        graph.add_conditional_edges(agent, should_continue, {"tools": "tools", END: END})
-
-    graph.add_conditional_edges(
-        "tools",
-        route_back_to_current_agent,
         {
             "sql_agent": "sql_agent",
             "rag_agent": "rag_agent",
             "bill_agent": "bill_agent",
             "analytics_agent": "analytics_agent",
             "general_agent": "general_agent",
-        }
+        },
     )
 
+    for agent in VALID_AGENTS:
+        graph.add_conditional_edges(agent, should_continue, {"tools": "tools", "reflect": "reflect"})
+
+    graph.add_conditional_edges(
+        "tools",
+        route_back_to_current_agent,
+        {agent: agent for agent in VALID_AGENTS},
+    )
+    graph.add_edge("reflect", END)
     return graph.compile()
 
 
-# ══════════════════════════════════════════════════════════════════
-# PUBLIC API: run the graph for one user turn
-# ══════════════════════════════════════════════════════════════════
-
-# Compiled graph (singleton)
 _graph = None
+
 
 def get_graph():
     global _graph
@@ -254,91 +294,80 @@ def run_agent(
     history: list[dict] | None = None,
     file_base64: str | None = None,
     file_name: str | None = None,
+    user_id: int | None = None,
+    session_token: str | None = None,
 ) -> dict:
-    """
-    Run the multi-agent graph for one user turn.
-
-    Args:
-        user_message : Plain text from the user
-        history      : List of {"role": "user"/"assistant", "content": "..."} dicts
-        file_base64  : Optional base64-encoded bill file (image or PDF)
-        file_name    : Uploaded file name used to detect PDF/image handling
-
-    Returns:
-        {
-          "response"  : str — final assistant message
-          "route"     : str — which agent handled it
-          "tools_used": list[str]
-          "error"     : str | None
-        }
-    """
-    # ── Guardrail check ──────────────────────────────────────────
     passed, reason = run_guardrails(user_message)
     if not passed:
-        return {"response": f"⚠️ Request blocked: {reason}",
-                "route": "guardrail", "tools_used": [], "error": reason}
+        return {"response": f"Request blocked: {reason}", "route": "guardrail", "tools_used": [], "error": reason}
 
-    # ── Build message history ────────────────────────────────────
     messages: list[BaseMessage] = []
-    for h in (history or []):
-        if h["role"] == "user":
-            messages.append(HumanMessage(content=h["content"]))
-        elif h["role"] == "assistant":
-            messages.append(AIMessage(content=h["content"]))
+    for item in history or []:
+        role = item.get("role")
+        content = item.get("content", "")
+        if role == "user":
+            messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            messages.append(AIMessage(content=content))
 
-    # Attach file to message if provided
     if file_base64:
-        # Signal the bill agent via a structured message (don't include base64 in history)
-        content = [
-            {"type": "text",
-             "text": f"{user_message}\n\n[FILE_ATTACHED]: Document uploaded for analysis"},
-        ]
+        content = [{"type": "text", "text": f"{user_message}\n\n[FILE_ATTACHED]: Document uploaded for analysis"}]
         messages.append(HumanMessage(content=content))
-        # Store file_base64 separately for the bill agent
-        file_data = file_base64
     else:
         messages.append(HumanMessage(content=user_message))
-        file_data = None
 
-    # ── Run the graph ────────────────────────────────────────────
+    with SessionLocal() as db:
+        memory_context = build_memory_context(db, user_id, session_token)
+
+    initial_state: AgentState = {
+        "messages": messages,
+        "next_agent": "general_agent",
+        "current_agent": "general_agent",
+        "final_answer": "",
+        "file_base64": file_base64,
+        "file_name": file_name,
+        "user_id": user_id,
+        "session_token": session_token,
+        "memory_context": memory_context,
+        "plan": "",
+        "reflection": "",
+    }
+
     try:
-        initial_state: AgentState = {
-            "messages": messages,
-            "next_agent": "general_agent",
-            "current_agent": "general_agent",
-            "final_answer": "",
-            "file_base64": file_data,
-            "file_name": file_name,
-        }
         result = get_graph().invoke(initial_state)
-
-        # Extract final AI response
-        final_msg = next(
-            (m for m in reversed(result["messages"])
-             if isinstance(m, AIMessage) and m.content),
-            None
-        )
-        response_text = sanitize_output(final_msg.content if final_msg else "No response generated.")
-
-        # Collect tool names used
+        final_text = sanitize_output(result.get("final_answer") or "No response generated.")
         tools_used = [
             tc["name"]
-            for m in result["messages"]
-            if hasattr(m, "tool_calls")
-            for tc in (m.tool_calls or [])
+            for message in result["messages"]
+            if hasattr(message, "tool_calls")
+            for tc in (message.tool_calls or [])
         ]
 
-        return {
-            "response":   response_text,
-            "route":      result.get("current_agent", result.get("next_agent", "unknown")),
-            "tools_used": list(set(tools_used)),
-            "error":      None,
-        }
+        if user_id and session_token:
+            with SessionLocal() as db:
+                remember_turn(
+                    db=db,
+                    user_id=user_id,
+                    session_token=session_token,
+                    user_message=user_message,
+                    assistant_message=final_text,
+                    route=result.get("current_agent"),
+                )
 
-    except Exception as e:
         return {
-            "response": f"Agent error: {str(e)}",
+            "response": final_text,
+            "route": result.get("current_agent", result.get("next_agent", "unknown")),
+            "tools_used": list(dict.fromkeys(tools_used)),
+            "plan": result.get("plan", ""),
+            "reflection": result.get("reflection", ""),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "response": f"Agent error: {exc}",
             "route": "error",
             "tools_used": [],
-            "error": str(e),
+            "plan": "",
+            "reflection": "",
+            "error": str(exc),
         }
