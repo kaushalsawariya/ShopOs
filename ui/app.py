@@ -17,6 +17,7 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from agents.graph import run_agent
+import streamlit_mermaid as st_mermaid
 
 load_dotenv()
 
@@ -217,7 +218,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["🤖 AI Assistant", "⚙️ Settings"],
+        ["🤖 AI Assistant", "📊 Workflow Graph", "⚙️ Settings"],
         label_visibility="collapsed",
     )
 
@@ -466,6 +467,33 @@ if page == "🤖 AI Assistant":
             st.session_state.chat_history = []
             st.rerun()
 
+
+
+# ═════════════════════════════════════════════════════════════════
+# PAGE: WORKFLOW GRAPH
+# ═════════════════════════════════════════════════════════════════
+elif page == "📊 Workflow Graph":
+    st.title("📊 Agent Workflow Graph")
+    st.markdown("Visual representation of the LangGraph multi-agent architecture.")
+
+    mermaid_code = """
+    flowchart TD
+        A[User Message] --> B[Supervisor]
+        B --> C[SQL Agent]
+        B --> D[RAG Agent]
+        B --> E[BILL Agent]
+        B --> F[ANALYTICS Agent]
+        B --> G[GENERAL Agent]
+        C --> H[Tool Calls]
+        D --> H
+        E --> H
+        F --> H
+        G --> I[Direct LLM]
+        H --> J[Final Answer]
+        I --> J
+    """
+
+    st_mermaid.st_mermaid(mermaid_code, height=400)
 
 
 # ═════════════════════════════════════════════════════════════════

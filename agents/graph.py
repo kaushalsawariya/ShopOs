@@ -1,31 +1,4 @@
-"""
-agents/graph.py
----------------
-LangGraph Multi-Agent Supervisor Architecture.
 
-Flow:
-  User message
-       │
-       ▼
-  ┌─────────────┐
-  │  SUPERVISOR  │  ← decides which specialist to route to
-  └──────┬──────┘
-         │ routes to one of:
-    ┌────┴────┬──────────┬──────────┬──────────┐
-    ▼         ▼          ▼          ▼          ▼
-  SQL       RAG        BILL      ANALYTICS  GENERAL
- Agent    Agent      Agent      Agent       Agent
-    │         │          │          │          │
-    └────┬────┴──────────┴──────────┘          │
-         ▼                                     ▼
-     Tool calls                          Direct LLM
-         │
-         ▼
-     Final Answer
-
-Each specialist agent has access to relevant MCP tools only.
-The supervisor reads agent outputs and decides if another agent is needed.
-"""
 
 import os
 from typing import Annotated, TypedDict
@@ -82,7 +55,8 @@ Respond with ONLY the agent name."""
 def supervisor_node(state: AgentState) -> AgentState:
     """Routes the conversation to the appropriate specialist."""
     if state.get("file_base64"):
-        return {**state, "next_agent": "bill_agent"}
+        return {**state, "next_agent": "bill_agent"} 
+    #  If no file, use LLM to route based on message content
 
     llm = make_llm()
     # Get the last human message for routing decision
